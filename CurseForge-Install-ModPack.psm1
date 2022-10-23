@@ -1,11 +1,16 @@
 using namespace System.IO.Compression
 
-Add-Type -AssemblyName "System.IO.Compression"
-Add-Type -AssemblyName "System.IO.Compression.FileSystem"
+Add-Type -AssemblyName 'System.IO.Compression'
+Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
 
-$InformationPreference = "Continue"
+$InformationPreference = 'Continue'
 
-$global:CurseApiBaseUri = "https://api.curseforge.com"
+if (-not (test-path variable:IsWindows)) {
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSAvoidAssignmentToAutomaticVariable', $null, Justification = 'because polyfilling')]
+    $IsWindows = 'Windows_NT' -eq $env:OS
+}
+
+$global:CurseApiBaseUri = 'https://api.curseforge.com/'
 
 $global:CurseApiTimeoutSec = 30
 
@@ -29,11 +34,25 @@ function Invoke-CurseApi {
     )
 
     if ([string]::IsNullOrEmpty($env:CurseApiKey)) {
-        throw "CurseApiKey environment variable not set."
+        throw 'CurseApiKey environment variable not set.'
+    }
+
+    [uri]$baseUri = $null
+    $isValid = [uri]::TryCreate($CurseApiBaseUri, [UriKind]::Absolute, ([ref]$baseUri))
+    if (-not $isValid) {
+        throw [ArgumentException]::new('$CurseApiBaseUri variable is not a valid absolute URI.', '$global:CurseApiBaseUri')
+    }
+
+    [uri]$fullUri = $null
+    $isValid = [uri]::TryCreate($baseUri, $Uri, ([ref]$fullUri))
+    if (-not $isValid) {
+        throw [ArgumentException]::new('Uri parameter is not a valid relative URI.', 'Uri')
     }
 
     $req = @{
-        Uri = $CurseApiBaseUri.TrimEnd('/') +'/'+ $Uri.TrimStart('/')
+        UseBasicParsing = $true
+        TimeoutSec = $CurseApiTimeoutSec
+        Uri = $fullUri
         Headers = @{
             'x-api-key' = $env:CurseApiKey
         }
@@ -49,7 +68,7 @@ function Invoke-CurseApi {
     $ProgressPreference = 'SilentlyContinue'
 
     try {
-        $res = Invoke-RestMethod @req -UseBasicParsing -TimeoutSec $CurseApiTimeoutSec
+        $res = Invoke-RestMethod @req
         $ProgressPreference = $currentProgPref
         Write-Verbose "Curse API completed request ""$Uri"""
         return $res
@@ -257,6 +276,10 @@ function Get-ModPackFiles {
         [PSCustomObject]$ModPackManifest
     )
 
+    if ($ModPackManifest.files.Length -eq 0) {
+        return @()
+    }
+
     $req = @{
         Uri = '/v1/mods/files'
         Method = 'POST'
@@ -312,7 +335,7 @@ function Get-CurseFileDownloadUrl {
     # Try to guess the Curse CDN uri for this file
     $id1 = [Math]::Truncate($File.id / 1000)
     $id2 = $File.id % 1000
-    return "https://mediafilez.forgecdn.net/files/$id1/$id2/$([Uri]::EscapeDataString($File.fileName))"
+    return "https://mediafilez.forgecdn.net/files/$id1/$id2/$([uri]::EscapeDataString($File.fileName))"
 }
 
 function Invoke-ModPackOverrides {
@@ -334,6 +357,20 @@ function Invoke-ModPackOverrides {
     tar -x -f $ModPack --strip-components $components -C $minecraft $Overrides
 }
 
+function Get-ManifestMCVersion {
+    param (
+        [PSCustomObject]$Manifest
+    )
+    
+    $version = @{
+        MinecraftVersion = $Manifest.minecraft.version
+        RawForgeVersion = $Manifest.minecraft.modLoaders | Where-Object primary | Select-Object -ExpandProperty id
+    }
+    $version.ForgeVersion = $version.RawForgeVersion -split '-' | Select-Object -Last 1
+    
+    return $version
+}
+
 function Install-ForgeServer {
     [CmdletBinding(DefaultParameterSetName = 'Manifest')]
     param (
@@ -346,27 +383,56 @@ function Install-ForgeServer {
     )
 
     if ($PSCmdlet.ParameterSetName -eq 'Manifest') {
-        $MinecraftVersion = $Manifest.minecraft.version
-        $rawForgeVersion = $Manifest.minecraft.modLoaders | Where-Object primary | Select-Object -ExpandProperty id
-        $ForgeVersion = $rawForgeVersion -split '-' | Select-Object -Last 1
+        $version = Get-ManifestMCVersion $Manifest
+        $MinecraftVersion = $version.MinecraftVersion
+        $ForgeVersion = $version.ForgeVersion
     }
 
     $fullVersion = "$MinecraftVersion-$ForgeVersion"
-    $installerJar = "forge-$fullVersion-installer.jar"
-    $installerUri = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/$fullVersion/$installerJar"
+    $serverJar = "forge-$fullVersion.jar"
 
-    Write-Verbose "Downloading Forge installer $fullVersion"
-    $res = Invoke-WebDownload -Uri $installerUri -OutFile $installerJar
-    if ($res -is [Exception]) {
-        throw New-Object -TypeName Exception -ArgumentList "Failed to download Forge installer $fullVersion`: $($res.Message)", $res
-    }
+    New-Item $minecraft -Type Directory -ErrorAction SilentlyContinue | Out-Null
 
-    Write-Verbose "Installing Forge server $fullVersion"
-    java -jar $installerJar --installServer
-    if (-not $?) {
-        throw New-Object -TypeName Exception -ArgumentList "Failed to install Forge server"
+    Push-Location $minecraft
+    try {
+
+        if (Test-Path $serverJar -ErrorAction Ignore) {
+            Write-Verbose "Forge server is already installed"
+            Invoke-CreateServerStartScript $serverJar
+            return;
+        }
+
+        $installerJar = "forge-$fullVersion-installer.jar"
+        $installerUri = "https://maven.minecraftforge.net/net/minecraftforge/forge/$fullVersion/$installerJar"
+
+        Write-Verbose "Downloading Forge installer $fullVersion"
+        $res = Invoke-WebDownload -Uri $installerUri -OutFile $installerJar
+        if ($res -is [Exception]) {
+            throw New-Object -TypeName Exception -ArgumentList "Failed to download Forge installer $fullVersion`: $($res.Message)", $res
+        }
+
+        Write-Verbose "Installing Forge server $fullVersion"
+        java -jar $installerJar --installServer
+        if (-not $?) {
+            throw New-Object -TypeName Exception -ArgumentList "Failed to install Forge server"
+        }
+        Remove-Item $installerJar
+
+        Invoke-CreateServerStartScript $serverJar
+
+        Write-Verbose "Installed Forge $fullVersion"
+
     }
-    Remove-Item $installerJar
+    finally {
+        Pop-Location
+    }
+}
+
+function Invoke-CreateServerStartScript {
+    param (
+        [Parameter(Mandatory)]
+        [string]$ServerJar
+    )
 
     Write-Verbose "Creating Start-Server script"
     $maxRam = "5G"
@@ -402,12 +468,13 @@ function Install-ForgeServer {
     )
     # Set-Content -Path java-args.txt -Value $javaArgs
 
-    if ('Windows_NT' -eq $env:OS) {
+    if ($IsWindows) {
         $script = 'start-server.bat'
         Set-Content -Path $script -Value @(
             "@echo off"
-            #"java -jar forge-$fullVersion.jar nogui @java-args.txt"
-            "java $($javaArgs -join ' ') -jar forge-$fullVersion.jar nogui"
+            'cd /d "%~dp0"'
+            #"java -jar $ServerJar nogui @java-args.txt"
+            "java $($javaArgs -join ' ') -jar $ServerJar nogui"
             "pause"
         )
     }
@@ -415,16 +482,38 @@ function Install-ForgeServer {
         $script = 'start-server.sh'
         Set-Content -Path $script -Value @(
             "#!/bin/bash"
-            #"java -jar forge-$fullVersion.jar nogui @java-args.txt"
-            "java $($javaArgs -join ' ') -jar forge-$fullVersion.jar nogui"
+            #"java -jar $ServerJar nogui @java-args.txt"
+            "java $($javaArgs -join ' ') -jar $ServerJar nogui"
             "pause"
         )
     }
-
-    Write-Verbose "Installed Forge $fullVersion"
 }
 
-function Write-ModPackInstructions {}
+function Write-ModPackInstructions {
+    param (
+        [PSCustomObject]$Manifest,
+        [switch]$Server
+    )
+
+    if ($Server) {
+        ""
+        "Run ""$(Join-Path $minecraft 'start-server')"" to start the server."
+        ""
+        return
+    }
+
+    $version = Get-ManifestMCVersion $Manifest
+
+    ""
+    "Installation:"
+    ""
+    "1. Download and run the Minecraft Forge installer version $($version.MinecraftVersion) - $($version.ForgeVersion)"
+    "from https://files.minecraftforge.net/net/minecraftforge/forge/index_$($version.MinecraftVersion).html"
+    ""
+    "2. In the Minecraft Launcher create a new instance using this Forge version"
+    "and the ""$(Convert-Path $minecraft)"" folder."
+    ""
+}
 
 function Install-ModPack {
     param (
@@ -451,7 +540,7 @@ function Install-ModPack {
     Write-Information "Copying modpack overrides"
     Invoke-ModPackOverrides $modpack.fileName $manifest.overrides
 
-    Write-ModPackInstructions $manifest
+    Write-ModPackInstructions $manifest -Server:$Server
 }
 
 # Examples:
