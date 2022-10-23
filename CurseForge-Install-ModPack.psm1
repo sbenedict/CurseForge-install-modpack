@@ -1,15 +1,16 @@
 using namespace System.IO.Compression
 
+Add-Type -AssemblyName "System.IO.Compression"
+Add-Type -AssemblyName "System.IO.Compression.FileSystem"
 
+$InformationPreference = "Continue"
 
 $global:CurseApiBaseUri = "https://api.curseforge.com"
 
 $global:CurseApiTimeoutSec = 30
 
 $script:minecraft = '.\minecraft'
-$script:temp = '.\extracted'
 
-# $minecraftCurseGameId = ((Invoke-RestMethod ($CurseApiBaseUri + '/v1/games') -Headers $headers).data | where-object slug -eq 'minecraft').id
 function Invoke-CurseApi {
     [CmdletBinding()]
     param (
@@ -27,7 +28,7 @@ function Invoke-CurseApi {
         [string]$OutFile
     )
 
-    if ($null -eq $env:CurseApiKey -or '' -eq $env:CurseApiKey) {
+    if ([string]::IsNullOrEmpty($env:CurseApiKey)) {
         throw "CurseApiKey environment variable not set."
     }
 
@@ -162,7 +163,7 @@ function Invoke-ModPackDownload {
             }
         }
         else {
-            $res = Invoke-CurseApi -Uri "/v1/mods/$ProjectId/files/$FileId"
+            $res = Invoke-CurseApi -Uri "/v1/mods/$ProjectId/files/$FileId" -ErrorVariable 'res'
             if (-not ($res -is [Exception])) {
                 $latestFile = $res.data
             }
@@ -185,7 +186,7 @@ function Invoke-ModPackDownload {
         }
         Write-Verbose "Saving file to ""$OutFile"""
 
-        $existingFile = Get-Item $OutFile -ErrorAction SilentlyContinue
+        $existingFile = Get-Item -LiteralPath $OutFile -ErrorAction SilentlyContinue
         if ($? -and $existingFile.Length -eq $latestFile.fileLength) {
             Write-Information "Modpack file ""$OutFile"" already exists"
             return $latestFile
@@ -202,11 +203,13 @@ function Invoke-ModPackExtract {
     param (
         # Path to the modpack zip file to extract
         [Parameter(Mandatory)]
-        [string]$FileName
+        [string]$FileName,
+        # Path to save the files extracted from the modpack
+        [string]$Destination
     )
 
-    New-Item $temp -Type Directory -ErrorAction SilentlyContinue | Out-Null
-    Expand-Archive $FileName $temp -Force
+    New-Item $Destination -Type Directory -ErrorAction SilentlyContinue | Out-Null
+    Expand-Archive $FileName $Destination -Force
 }
 
 function Get-ZipContent {
@@ -241,7 +244,11 @@ function Get-ZipContent {
 }
 
 function Get-ModPackManifest {
-    return Get-Content .\extracted\manifest.json | ConvertFrom-Json
+    param (
+        [Parameter(Mandatory)]
+        [string]$ZipFile
+    )
+    return Get-ZipContent $ZipFile manifest.json | ConvertFrom-Json
 }
 
 function Get-ModPackFiles {
@@ -259,7 +266,7 @@ function Get-ModPackFiles {
     }
     $res = Invoke-CurseApi @req
     if ($res -is [Exception]) {
-        Write-Error "Failed to get modpack files" -Exception $res
+        Write-Error -Message "Failed to get modpack files" -Exception $res
         return
     }
 
@@ -272,7 +279,7 @@ function Invoke-ModPackFilesDownload {
     param (
         # List of modpack files to download
         [Parameter(Mandatory)]
-        [object[]]$Files,
+        [PSCustomObject[]]$Files,
         # Force download of all files even if they already exist and the length matches
         [Parameter()]
         [switch]$Force = $false
@@ -282,11 +289,11 @@ function Invoke-ModPackFilesDownload {
     $Files `
         | Where-Object {
             $Force `
-            -or $nul -eq ($f = Get-Item (Join-Path $mods $_.fileName) -ErrorAction SilentlyContinue) `
+            -or $nul -eq ($f = Get-Item -LiteralPath (Join-Path $mods $_.fileName) -ErrorAction SilentlyContinue) `
             -or $f.Length -ne $_.fileLength
         } `
         | ForEach-Object { @{
-            Uri = $_.downloadUrl
+            Uri = (Get-CurseFileDownloadUrl $_)
             OutFile = (Join-Path $mods $_.fileName)
         } } `
         | Invoke-WebDownloadAll `
@@ -294,52 +301,164 @@ function Invoke-ModPackFilesDownload {
         | ForEach-Object { Write-Error -Message "Failed to download ""$($_.Request.Uri)""" -Exception $_.Response }
 }
 
+function Get-CurseFileDownloadUrl {
+    param (
+        [PSCustomObject]$File
+    )
+    if ($null -ne $File.downloadUrl) {
+        return $File.downloadUrl
+    }
+
+    # Try to guess the Curse CDN uri for this file
+    $id1 = [Math]::Truncate($File.id / 1000)
+    $id2 = $File.id % 1000
+    return "https://mediafilez.forgecdn.net/files/$id1/$id2/$([Uri]::EscapeDataString($File.fileName))"
+}
+
 function Invoke-ModPackOverrides {
     param (
+        # Path to the modpack zip file
+        [Parameter(Mandatory)]
+        [string]$ModPack,
         # Path to the source folder containing the files to be overridden
         [Parameter(Mandatory)]
         [string]$Overrides
     )
-    $Overrides = (Join-Path $Overrides '*')
-    Write-Verbose "Copying overrides from ""$Overrides"" to ""$minecraft"""
-    Copy-Item -Path $Overrides -Destination $minecraft -Recurse -Force
+
+    if ($null -eq (Get-Command tar -ErrorAction SilentlyContinue)) {
+        throw "Command tar is not available."
+    }
+
+    Write-Verbose "Copying overrides from ""$(Join-Path $ModPack $Overrides)"" to ""$minecraft"""
+    $components = $Overrides.Trim('\', '/').Split(@('\', '/')).Count
+    tar -x -f $ModPack --strip-components $components -C $minecraft $Overrides
 }
 
-function Invoke-ModPackCleanup {
-    Remove-Item -Path .\extracted -Recurse
+function Install-ForgeServer {
+    [CmdletBinding(DefaultParameterSetName = 'Manifest')]
+    param (
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Manifest')]
+        [PSCustomObject]$Manifest,
+        [Parameter(Mandatory, ParameterSetName = 'Version')]
+        [string]$MinecraftVersion,
+        [Parameter(Mandatory, ParameterSetName = 'Version')]
+        [string]$ForgeVersion
+    )
+
+    if ($PSCmdlet.ParameterSetName -eq 'Manifest') {
+        $MinecraftVersion = $Manifest.minecraft.version
+        $rawForgeVersion = $Manifest.minecraft.modLoaders | Where-Object primary | Select-Object -ExpandProperty id
+        $ForgeVersion = $rawForgeVersion -split '-' | Select-Object -Last 1
+    }
+
+    $fullVersion = "$MinecraftVersion-$ForgeVersion"
+    $installerJar = "forge-$fullVersion-installer.jar"
+    $installerUri = "https://files.minecraftforge.net/maven/net/minecraftforge/forge/$fullVersion/$installerJar"
+
+    Write-Verbose "Downloading Forge installer $fullVersion"
+    $res = Invoke-WebDownload -Uri $installerUri -OutFile $installerJar
+    if ($res -is [Exception]) {
+        throw New-Object -TypeName Exception -ArgumentList "Failed to download Forge installer $fullVersion`: $($res.Message)", $res
+    }
+
+    Write-Verbose "Installing Forge server $fullVersion"
+    java -jar $installerJar --installServer
+    if (-not $?) {
+        throw New-Object -TypeName Exception -ArgumentList "Failed to install Forge server"
+    }
+    Remove-Item $installerJar
+
+    Write-Verbose "Creating Start-Server script"
+    $maxRam = "5G"
+    $javaArgs = @(
+        "-Xmx$maxRam",
+        #"-Xms$maxRam",
+        "-version:1.8+",
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=200",
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:+AlwaysPreTouch",
+        "-XX:G1NewSizePercent=30",
+        "-XX:G1MaxNewSizePercent=40",
+        "-XX:G1HeapRegionSize=8M",
+        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapWastePercent=5",
+        "-XX:G1MixedGCCountTarget=4",
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:G1RSetUpdatingPauseTimePercent=5",
+        "-XX:SurvivorRatio=32",
+        "-XX:+PerfDisableSharedMem",
+        "-XX:MaxTenuringThreshold=1",
+        "-Dusing.aikars.flags=https://mcflags.emc.gs",
+        "-Daikars.new.flags=true",
+        "-Dfml.readTimeout=90", # servertimeout
+        "-Dfml.queryResult=confirm", # auto /fmlconfirm
+        "--add-opens=java.base/sun.security.util=ALL-UNNAMED", # java16+ support
+        "--add-opens=java.base/java.util.jar=ALL-UNNAMED", # java16+ support
+        "-XX:+IgnoreUnrecognizedVMOptions" # java16+ support
+    )
+    # Set-Content -Path java-args.txt -Value $javaArgs
+
+    if ('Windows_NT' -eq $env:OS) {
+        $script = 'start-server.bat'
+        Set-Content -Path $script -Value @(
+            "@echo off"
+            #"java -jar forge-$fullVersion.jar nogui @java-args.txt"
+            "java $($javaArgs -join ' ') -jar forge-$fullVersion.jar nogui"
+            "pause"
+        )
+    }
+    else {
+        $script = 'start-server.sh'
+        Set-Content -Path $script -Value @(
+            "#!/bin/bash"
+            #"java -jar forge-$fullVersion.jar nogui @java-args.txt"
+            "java $($javaArgs -join ' ') -jar forge-$fullVersion.jar nogui"
+            "pause"
+        )
+    }
+
+    Write-Verbose "Installed Forge $fullVersion"
 }
 
 function Write-ModPackInstructions {}
 
-function Get-ModPack {
+function Install-ModPack {
     param (
         [Parameter(Mandatory)]
         [int]$ProjectId,
-        [int]$FileId
+        [int]$FileId,
+        [switch]$Server
     )
 
     Write-Information "Downloading modpack ""$($ProjectId)"""
-    $latestFile = Invoke-ModPackDownload -ProjectId $ProjectId -FileId $FileId
-
-    Write-Information "Extracting modpack file ""$($latestFile.displayName)"""
-    Invoke-ModPackExtract $latestFile.fileName
+    $modpack = Invoke-ModPackDownload -ProjectId $ProjectId -FileId $FileId
 
     Write-Information "Loading modpack manifest"
-    $manifest = Get-ModPackManifest
+    $manifest = Get-ModPackManifest $modpack.fileName
+
+    if ($Server) {
+        Write-Information "Installing Forge Server"
+        Install-ForgeServer -Manifest $manifest
+    }
 
     Write-Information "Downloading modpack dependencies"
     Invoke-ModPackFilesDownload (Get-ModPackFiles $manifest)
 
     Write-Information "Copying modpack overrides"
-    Invoke-ModPackOverrides (Join-Path '.\extracted' $manifest.overrides)
-
-    Write-Information "Cleaning up"
-    Invoke-ModPackCleanup
+    Invoke-ModPackOverrides $modpack.fileName $manifest.overrides
 
     Write-ModPackInstructions $manifest
 }
 
 # Examples:
+#
+# Install-ModPack -ProjectId 638321 # Feed the Factory
+# Install-ModPack -ProjectId 282744 # Enigmatica2Expert
+# 
 # @(
 #     @{ Uri="https://google.com"; OutFile="google.txt" },
 #     @{ Uri="https://google.com"; OutFile="google2.txt" }
@@ -350,53 +469,28 @@ function Get-ModPack {
 # Invoke-ModPackExtract $latestFile.fileName
 # Get-ModPackManifest
 # Invoke-ModPackFilesDownload (Get-ModPackFiles (Get-ModPackManifest))
-
-
-#$res = Invoke-CurseApi ('/v1/mods/' + $projectId + '/files')
-#return $res
-
-
-# $ProgressPreference = 'SilentlyContinue'
-# $ProgressPreference = 'Continue'
-
-# # $projectId = 638321 # Feed the Factory
-
-# # $res = Invoke-RestMethod ($CurseApiBaseUri + '/v1/mods/' + $projectId) -Headers $headers
-
-# # $modFiles = (Invoke-RestMethod ($CurseApiBaseUri + '/v1/mods/' + $projectId + '/files') -Headers $headers).data
-# # $latestFile = $modFiles | Sort-Object fileDate -Descending | Select-Object -First 1
-# # $req = @{
-# #     Uri = $latestFile.downloadUrl
-# #     OutFile = Join-Path $modpacks $( $latestFile.fileName ).downloading
-# #     UseBasicParsing = $true
-# # }
-# # Invoke-WebRequest $req
-
-# # New-Item $modpacks\$( [IO.Path]::GetFileNameWithoutExtension($latestFile.fileName) ) -ItemType Directory -ErrorAction SilentlyContinue
-
-
-
-# # $uri
-
-
-
-# # $curseApiProjectSearchUrl = "/addon/search"
-
-# # $searchFilter = "Feed the Factory"
-
-# # $query = @{
-# #     gameId = 432;
-# #     categoryId = 0;
-# #     sectionId = 4471;
-# #     searchFilter = $searchFilter;
-# #     pageSize = 20;
-# #     index = 0;
-# #     sort = 1;
-# #     sortDescending = $true;
-# # }
-
-# # $queryString = (( $query.GetEnumerator() | foreach-object { "$($_.Name)=$($_.Value)" } ) -join '&')
-
-# # Invoke-RestMethod ($CurseApiBaseUri + $curseApiProjectSearchUrl + '?' + $queryString) -Headers @{"x-api-key" = $env:CurseApiKey}
-
-
+# $res = Invoke-CurseApi ('/v1/mods/' + $projectId + '/files')
+# $minecraftCurseGameId = ((Invoke-RestMethod ($CurseApiBaseUri + '/v1/games') -Headers $headers).data | where-object slug -eq 'minecraft').id
+#
+# Invoke-RestMethod ($CurseApiBaseUri + '/addon/search') -Body @{
+#     gameId = 432
+#     categoryId = 0
+#     sectionId = 4471
+#     searchFilter = "Feed the Factory"
+#     pageSize = 20
+#     index = 0
+#     sort = 1
+#     sortDescending = $true
+# } -Headers @{"x-api-key" = $env:CurseApiKey}
+#
+# (Invoke-RestMethod ($CurseApiBaseUri + '/v1/mods/search') -Body @{
+#     'gameId' = 432
+#     'classId' = 4471
+#     'searchFilter' = $null
+#     'slug' = 'feed-the-factory'
+#     'pageSize' = 20
+#     'index' = 0
+#     'sortField' = 3
+#     'sortOrder' = $true
+# } -Headers @{"x-api-key" = $env:CurseApiKey} `
+# ).data | format-table
