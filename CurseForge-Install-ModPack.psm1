@@ -1,3 +1,23 @@
+#
+# Examples:
+#
+# Install-ModPack -ProjectId 638321 # Feed the Factory
+#
+# Install-ModPack -ProjectId 282744 -Server # Enigmatica2Expert
+# 
+# $minecraftCurseGameId = ((Invoke-CurseApi -Uri '/v1/games').data | where-object slug -eq 'minecraft').id
+#
+# (Invoke-CurseApi -Uri '/v1/mods/search' -Body @{
+#     'gameId' = 432
+#     'classId' = 4471
+#     'searchFilter' = 'craft'
+#     'slug' = $null
+#     'pageSize' = 10
+#     'index' = 0
+#     'sortField' = 3
+#     'sortOrder' = $true
+# }).data | Format-List
+#
 using namespace System.IO.Compression
 
 Add-Type -AssemblyName 'System.IO.Compression'
@@ -542,44 +562,3 @@ function Install-ModPack {
 
     Write-ModPackInstructions $manifest -Server:$Server
 }
-
-# Examples:
-#
-# Install-ModPack -ProjectId 638321 # Feed the Factory
-# Install-ModPack -ProjectId 282744 # Enigmatica2Expert
-# 
-# @(
-#     @{ Uri="https://google.com"; OutFile="google.txt" },
-#     @{ Uri="https://google.com"; OutFile="google2.txt" }
-# ) | Invoke-WebDownloadAll
-#
-# cd temp
-# $latestFile = Invoke-ModPackDownload -ProjectId 638321 # Feed the Factory
-# Invoke-ModPackExtract $latestFile.fileName
-# Get-ModPackManifest
-# Invoke-ModPackFilesDownload (Get-ModPackFiles (Get-ModPackManifest))
-# $res = Invoke-CurseApi ('/v1/mods/' + $projectId + '/files')
-# $minecraftCurseGameId = ((Invoke-RestMethod ($CurseApiBaseUri + '/v1/games') -Headers $headers).data | where-object slug -eq 'minecraft').id
-#
-# Invoke-RestMethod ($CurseApiBaseUri + '/addon/search') -Body @{
-#     gameId = 432
-#     categoryId = 0
-#     sectionId = 4471
-#     searchFilter = "Feed the Factory"
-#     pageSize = 20
-#     index = 0
-#     sort = 1
-#     sortDescending = $true
-# } -Headers @{"x-api-key" = $env:CurseApiKey}
-#
-# (Invoke-RestMethod ($CurseApiBaseUri + '/v1/mods/search') -Body @{
-#     'gameId' = 432
-#     'classId' = 4471
-#     'searchFilter' = $null
-#     'slug' = 'feed-the-factory'
-#     'pageSize' = 20
-#     'index' = 0
-#     'sortField' = 3
-#     'sortOrder' = $true
-# } -Headers @{"x-api-key" = $env:CurseApiKey} `
-# ).data | format-table
